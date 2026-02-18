@@ -497,54 +497,66 @@ impl WebusbEndpoint {
                     let array = Uint8Array::from(data.as_slice());
                     let array_obj = Object::try_from(&array).expect("an object");
 
-                    let result = JsFuture::from(
-                        device
-                            .device
-                            .device
-                            .transfer_out_with_buffer_source(endpoint_number, array_obj)
-                            .expect("transfers are possible"),
-                    )
-                    .await
-                    .expect("transfers don't fail");
+                    let promise = device
+                        .device
+                        .device
+                        .transfer_out_with_buffer_source(endpoint_number, array_obj);
 
-                    let transfer_result: UsbOutTransferResult = JsCast::unchecked_from_js(result);
+                    let fut = async { JsFuture::from(promise?).await };
 
-                    unsafe {
-                        (*ptr).status = transfer_result.status();
-                        (*ptr).actual_len = transfer_result.bytes_written();
+                    match fut.await {
+                        Ok(result) => {
+                            let transfer_result: UsbOutTransferResult = JsCast::unchecked_from_js(result);
 
-                        notify_completion::<TransferData>(ptr)
-                    }
+                            unsafe {
+                                (*ptr).actual_len = transfer_result.bytes_written();
+                                (*ptr).status = transfer_result.status();
+                            }
+                        }
+                        Err(_) => unsafe {
+                            (*ptr).actual_len = 0;
+                            (*ptr).status = web_sys::UsbTransferStatus::Stall;
+                        }
+                    };
                 }
                 Direction::In => {
                     let endpoint_number = address & (!0x80);
 
                     let mut data = ManuallyDrop::new(buffer.into_vec());
                     let len = data.len() as u32;
-                    let result = JsFuture::from(device.device.device.transfer_in(endpoint_number, len))
-                        .await
-                        .expect("transfers are possible");
+                    let result = JsFuture::from(device.device.device.transfer_in(endpoint_number, len)).await;
 
-                    let transfer_result: UsbInTransferResult = JsCast::unchecked_from_js(result);
-                    let received_data = Uint8Array::new(
-                        &transfer_result
-                            .data()
-                            .expect("a data buffer is present")
-                            .buffer(),
-                    );
+                    match result {
+                        Ok(r) => {
+                            let transfer_result: UsbInTransferResult = JsCast::unchecked_from_js(r);
+                            let received_data = Uint8Array::new(
+                                &transfer_result
+                                    .data()
+                                    .expect("a data buffer is present")
+                                    .buffer(),
+                            );
 
-                    data.resize(received_data.length() as usize, 0);
-                    received_data.copy_to(&mut data[..received_data.length() as usize]);
+                            data.resize(received_data.length() as usize, 0);
+                            received_data.copy_to(&mut data[..received_data.length() as usize]);
 
-                    unsafe {
-                        (*ptr).actual_len = received_data.length();
-                        (*ptr).status = transfer_result.status();
-
-                        notify_completion::<TransferData>(ptr)
+                            unsafe {
+                                (*ptr).actual_len = received_data.length();
+                                (*ptr).status = transfer_result.status();
+                            }
+                        }
+                        Err(_) => unsafe {
+                            (*ptr).actual_len = 0;
+                            (*ptr).status = web_sys::UsbTransferStatus::Stall;
+                        }
                     }
                 }
             }
+
+            unsafe {
+                notify_completion::<TransferData>(ptr)
+            }
         });
+
         self.pending.push_back(transfer);
     }
 
