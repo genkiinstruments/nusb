@@ -224,6 +224,7 @@ impl Device {
                 device
                     .get_descriptor(desc_type, desc_index, language_id, timeout)
                     .await
+                    .map_err(|_| GetDescriptorError::Transfer(TransferError::Fault)) // TODO: proper error parsing
             })
         }
     }
@@ -818,7 +819,6 @@ impl<EpType: BulkOrInterrupt, Dir: EndpointDirection> Endpoint<EpType, Dir> {
     /// ## Panics
     ///  * if there are no transfers pending (that is, if [`Self::pending()`]
     ///    would return 0).
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn wait_next_complete(&mut self, timeout: Duration) -> Option<Completion> {
         self.backend.wait_next_complete(timeout)
     }

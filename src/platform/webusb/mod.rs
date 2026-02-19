@@ -3,11 +3,9 @@ mod enumeration;
 mod hotplug;
 mod transfer;
 
-use std::io::Error;
-
 pub(crate) use transfer::TransferData;
 
-pub use enumeration::{list_buses, list_devices};
+pub use enumeration::list_devices;
 
 pub(crate) use device::UniqueUsbDevice;
 pub(crate) use device::WebusbDevice as Device;
@@ -24,7 +22,7 @@ use web_sys::UsbDevice;
 use web_sys::Window;
 use web_sys::WorkerGlobalScope;
 
-use crate::transfer::TransferError;
+use crate::{{Error, ErrorKind}, transfer::TransferError};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct DeviceId {
@@ -55,6 +53,12 @@ impl DeviceId {
     }
 }
 
+// TODO: JS doesn't have "numeric error codes"
+//       Could map common error types to a number?
+pub fn format_os_error_code(f: &mut std::fmt::Formatter<'_>, code: u32) -> std::fmt::Result {
+    write!(f, "error 0x{:08x}", code)
+}
+
 pub(crate) fn webusb_status_to_nusb_transfer_error(
     status: web_sys::UsbTransferStatus,
 ) -> Result<(), TransferError> {
@@ -80,14 +84,17 @@ pub(crate) fn usb() -> Result<Usb, Error> {
         return Ok(wgs.navigator().usb());
     }
 
-    Err(Error::other("WebUSB is not available on this platform"))
+    Err(Error::new(ErrorKind::Unsupported, "WebUSB is not available on this platform"))
 }
 
-pub fn js_value_to_io_error(value: JsValue) -> std::io::Error {
+pub fn js_value_to_nusb_error(value: JsValue) -> Error {
     let value: js_sys::Error = value
         .dyn_into()
         .unwrap_or_else(|_| js_sys::Error::new("error could not be constructed"));
-    std::io::Error::other(value.message().as_string().unwrap_or_default())
+    Error::new(ErrorKind::Other,
+        "can't have js strings as &'static str :/"
+        // value.message().as_string().unwrap_or_default()
+    )
 }
 
 pub fn js_value_to_transfer_error(value: JsValue) -> TransferError {

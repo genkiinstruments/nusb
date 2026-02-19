@@ -4,7 +4,7 @@ use std::{
     mem::ManuallyDrop,
     ops::{Deref, DerefMut},
     pin::Pin,
-    ptr::NonNull,
+    ptr::{NonNull, addr_of_mut},
     sync::{
         atomic::{AtomicU8, Ordering},
         Arc, Mutex,

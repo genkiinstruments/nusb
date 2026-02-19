@@ -5,9 +5,9 @@ use web_sys::UsbDevice;
 
 use crate::{
     descriptors::ConfigurationDescriptor,
-    maybe_future::{future::ActualFuture, Ready},
+    maybe_future::{future::ActualFuture},
     platform::webusb::device::{extract_decriptors, extract_string},
-    BusInfo, DeviceInfo, Error, InterfaceInfo, MaybeFuture,
+    DeviceInfo, Error, ErrorKind, InterfaceInfo, MaybeFuture,
 };
 
 use super::UniqueUsbDevice;
@@ -18,7 +18,7 @@ pub fn list_devices() -> impl MaybeFuture<Output = Result<impl Iterator<Item = D
         let usb = super::usb()?;
         let devices = JsFuture::from(usb.get_devices())
             .await
-            .map_err(|e| Error::other(format!("WebUSB devices could not be listed: {e:?}")))?;
+            .map_err(|_| Error::new(ErrorKind::Other, "WebUSB devices could not be listed"))?;
 
         let devices: Array = JsCast::unchecked_from_js(devices);
 
@@ -27,7 +27,7 @@ pub fn list_devices() -> impl MaybeFuture<Output = Result<impl Iterator<Item = D
             let device: UsbDevice = JsCast::unchecked_from_js(device);
             JsFuture::from(device.open())
                 .await
-                .map_err(|e| Error::other(format!("WebUSB device could not be opened: {e:?}")))?;
+                .map_err(|_| Error::new(ErrorKind::Other, "WebUSB device could not be opened"))?;
 
             let device = Arc::new(UniqueUsbDevice::new(device));
 
@@ -35,7 +35,7 @@ pub fn list_devices() -> impl MaybeFuture<Output = Result<impl Iterator<Item = D
             result.push(device_info);
             JsFuture::from(device.close())
                 .await
-                .map_err(|e| Error::other(format!("WebUSB device could not be closed: {e:?}")))?;
+                .map_err(|_| Error::new(ErrorKind::Other, "WebUSB device could not be closed"))?;
         }
 
         Ok(result)
@@ -44,14 +44,8 @@ pub fn list_devices() -> impl MaybeFuture<Output = Result<impl Iterator<Item = D
     ActualFuture::new(async move { Ok(inner().await?.into_iter()) })
 }
 
-pub fn list_buses() -> impl MaybeFuture<Output = Result<impl Iterator<Item = BusInfo>, Error>> {
-    Ready(Ok(vec![].into_iter()))
-}
-
 pub(crate) async fn device_to_info(device: Arc<UniqueUsbDevice>) -> Result<DeviceInfo, Error> {
     Ok(DeviceInfo {
-        bus_id: "webusb".to_string(),
-        device_address: 0,
         vendor_id: device.vendor_id(),
         product_id: device.product_id(),
         device_version: ((device.device_version_major() as u16) << 8)
@@ -89,8 +83,6 @@ pub(crate) async fn device_to_info(device: Arc<UniqueUsbDevice>) -> Result<Devic
             }
             interfaces
         },
-        port_chain: vec![],
-        max_packet_size_0: 255,
         device: device.clone(),
     })
 }

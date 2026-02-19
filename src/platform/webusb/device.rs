@@ -1,6 +1,5 @@
 use std::{
     collections::VecDeque,
-    io::{Error, ErrorKind},
     mem::ManuallyDrop,
     sync::{Arc, Mutex},
     task::{Context, Poll},
@@ -25,11 +24,11 @@ use crate::{
         internal::{notify_completion, take_completed_from_queue, Idle, Notify, Pending},
         Buffer, Completion, ControlIn, ControlOut, Direction, TransferError,
     },
-    ClaimEndpointError, DeviceInfo, MaybeFuture, Speed,
+    Error, ErrorKind, DeviceInfo, MaybeFuture, Speed,
 };
 
 use super::{
-    js_value_to_io_error, js_value_to_transfer_error, webusb_status_to_nusb_transfer_error,
+    js_value_to_nusb_error, js_value_to_transfer_error, webusb_status_to_nusb_transfer_error,
     TransferData,
 };
 
@@ -79,14 +78,14 @@ pub(crate) struct WebusbDevice {
 impl WebusbDevice {
     pub(crate) fn from_device_info(
         d: &DeviceInfo,
-    ) -> impl MaybeFuture<Output = Result<Arc<WebusbDevice>, std::io::Error>> {
+    ) -> impl MaybeFuture<Output = Result<Arc<WebusbDevice>, Error>> {
         let target_device = d.device.clone();
         let speed = d.speed;
         ActualFuture::new(async move {
             let usb = super::usb()?;
             let devices = JsFuture::from(usb.get_devices())
                 .await
-                .map_err(js_value_to_io_error)?;
+                .map_err(js_value_to_nusb_error)?;
             let devices: Array = JsCast::unchecked_from_js(devices);
 
             for device in devices {
@@ -94,7 +93,7 @@ impl WebusbDevice {
                 if device.eq(&target_device) {
                     JsFuture::from(device.open())
                         .await
-                        .map_err(js_value_to_io_error)?;
+                        .map_err(js_value_to_nusb_error)?;
 
                     let config_descriptors = extract_decriptors(&device).await?;
 
@@ -107,7 +106,7 @@ impl WebusbDevice {
                     }));
                 }
             }
-            Err(Error::other("device not found"))
+            Err(Error::new(ErrorKind::NotFound, "device not found"))
         })
     }
 
@@ -141,10 +140,11 @@ impl WebusbDevice {
         ActualFuture::new(async move {
             JsFuture::from(self.device.select_configuration(configuration))
                 .await
-                .map_err(|e| {
-                    Error::other(
-                        e.as_string()
-                            .unwrap_or_else(|| "No further error clarification available".into()),
+                .map_err(|_| {
+                    Error::new(ErrorKind::Other,
+                        "e.as_string() isn't &'static str :/"
+                        // e.as_string()
+                        //     .unwrap_or_else(|| "No further error clarification available".into())
                     )
                 })
                 .map(|_| ())
@@ -155,10 +155,12 @@ impl WebusbDevice {
         ActualFuture::new(async move {
             JsFuture::from(self.device.reset())
                 .await
-                .map_err(|e| {
-                    Error::other(
-                        e.as_string()
-                            .unwrap_or_else(|| "No further error clarification available".into()),
+                .map_err(|_| {
+                    Error::new(
+                        ErrorKind::Other,
+                        "e.as_string() isn't &'static str :/"
+                        // e.as_string()
+                        //     .unwrap_or_else(|| "No further error clarification available".into()),
                     )
                 })
                 .map(|_| ())
@@ -172,7 +174,7 @@ impl WebusbDevice {
         ActualFuture::new(async move {
             JsFuture::from(self.device.claim_interface(interface_number))
                 .await
-                .map_err(js_value_to_io_error)?;
+                .map_err(js_value_to_nusb_error)?;
 
             #[allow(clippy::arc_with_non_send_sync)]
             Ok(Arc::new(WebusbInterface {
@@ -241,7 +243,7 @@ pub async fn get_descriptor(
     );
     let res = wasm_bindgen_futures::JsFuture::from(device.control_transfer_in(&setup, 255))
         .await
-        .map_err(js_value_to_io_error)?;
+        .map_err(js_value_to_nusb_error)?;
     let res: UsbInTransferResult = JsCast::unchecked_from_js(res);
     Ok(Uint8Array::new(&res.data().expect("a data buffer").buffer()).to_vec())
 }
@@ -256,7 +258,7 @@ pub async fn extract_string(device: &UsbDevice, id: u16) -> Result<String, Error
     );
     let res = JsFuture::from(device.control_transfer_in(&setup, 255))
         .await
-        .map_err(js_value_to_io_error)?;
+        .map_err(js_value_to_nusb_error)?;
     let res: UsbInTransferResult = JsCast::unchecked_from_js(res);
     let mut data = Uint8Array::new(&res.data().expect("a data buffer").buffer()).to_vec();
 
@@ -268,7 +270,7 @@ pub async fn extract_string(device: &UsbDevice, id: u16) -> Result<String, Error
             .map(|c| ((c[1] as u16) << 8) | c[0] as u16)
             .collect::<Vec<_>>(),
     )
-    .map_err(|_| Error::other("invalid utf16"))
+    .map_err(|_| Error::new(ErrorKind::Other, "invalid utf16"))
 }
 
 #[derive(Clone)]
@@ -310,10 +312,12 @@ impl WebusbInterface {
                     .select_alternate_interface(self.interface_number, alternate_setting),
             )
             .await
-            .map_err(|e| {
-                Error::other(
-                    e.as_string()
-                        .unwrap_or_else(|| "No further error clarification available".into()),
+            .map_err(|_| {
+                Error::new(
+                    ErrorKind::Other,
+                    "e.as_string() isn't &'static str :/"
+                    // e.as_string()
+                    //     .unwrap_or_else(|| "No further error clarification available".into()),
                 )
             })
             .map(|_| ())?;
@@ -342,10 +346,12 @@ impl WebusbInterface {
             endpoint,
         ))
         .await
-        .map_err(|e| {
-            Error::other(
-                e.as_string()
-                    .unwrap_or_else(|| "No further error clarification available".into()),
+        .map_err(|_| {
+            Error::new(
+                ErrorKind::Other,
+                "e.as_string() isn't &'static str :/"
+                // e.as_string()
+                //     .unwrap_or_else(|| "No further error clarification available".into()),
             )
         })
         .map(|_| ())
@@ -408,7 +414,7 @@ impl WebusbInterface {
     pub fn endpoint(
         self: &Arc<Self>,
         descriptor: EndpointDescriptor,
-    ) -> Result<WebusbEndpoint, ClaimEndpointError> {
+    ) -> Result<WebusbEndpoint, Error> {
         let address = descriptor.address();
         let max_packet_size = descriptor.max_packet_size();
 
@@ -534,6 +540,15 @@ impl WebusbEndpoint {
         self.pending.push_back(transfer);
     }
 
+    pub(crate) fn submit_err(&mut self, buffer: Buffer, err: TransferError) {
+        assert_eq!(err, TransferError::InvalidArgument);
+        todo!();
+
+        // let mut transfer = self.make_transfer(buffer);
+        // transfer.status = io_kit_sys::ret::kIOReturnBadArgument;
+        // self.pending.push_back(transfer.simulate_complete());
+    }
+
     pub(crate) fn poll_next_complete(&mut self, cx: &mut Context) -> Poll<Completion> {
         self.inner.notify.subscribe(cx);
         let dir = Direction::from_address(self.inner.address);
@@ -544,6 +559,19 @@ impl WebusbEndpoint {
         } else {
             Poll::Pending
         }
+    }
+
+    pub(crate) fn wait_next_complete(&mut self, timeout: Duration) -> Option<Completion> {
+        todo!();
+
+        // self.inner.notify.wait_timeout(timeout, || {
+        //     take_completed_from_queue(&mut self.pending).map(|mut transfer| {
+        //         let dir = Direction::from_address(self.inner.address);
+        //         let completion = unsafe { transfer.take_completion(dir) };
+        //         self.idle_transfer = Some(transfer);
+        //         completion
+        //     })
+        // })
     }
 
     pub(crate) fn clear_halt(&self) -> impl MaybeFuture<Output = Result<(), Error>> {
@@ -560,10 +588,12 @@ impl WebusbEndpoint {
                 endpoint,
             ))
             .await
-            .map_err(|e| {
-                Error::other(
-                    e.as_string()
-                        .unwrap_or_else(|| "No further error clarification available".into()),
+            .map_err(|_| {
+                Error::new(
+                    ErrorKind::Other,
+                    "e.as_string() isn't &'static str :/"
+                    // e.as_string()
+                    //     .unwrap_or_else(|| "No further error clarification available".into()),
                 )
             })
             .map(|_| ())
