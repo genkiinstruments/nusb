@@ -475,13 +475,15 @@ impl WebusbEndpoint {
         let address = self.inner.address;
         let dir = Direction::from_address(self.inner.address);
 
-        transfer.buf = buffer.ptr;
-        transfer.capacity = buffer.capacity;
-        transfer.actual_len = 0;
-        transfer.requested_len = match dir {
+        let requested_len = match dir {
             Direction::Out => buffer.len,
             Direction::In => buffer.requested_len,
         };
+
+        transfer.buf = buffer.ptr;
+        transfer.capacity = buffer.capacity;
+        transfer.actual_len = 0;
+        transfer.requested_len = requested_len;
 
         let transfer = transfer.pre_submit();
         let ptr = transfer.as_ptr();
@@ -523,8 +525,7 @@ impl WebusbEndpoint {
                     let endpoint_number = address & (!0x80);
 
                     let mut data = ManuallyDrop::new(buffer.into_vec());
-                    let len = data.len() as u32;
-                    let result = JsFuture::from(device.device.device.transfer_in(endpoint_number, len)).await;
+                    let result = JsFuture::from(device.device.device.transfer_in(endpoint_number, requested_len)).await;
 
                     match result {
                         Ok(r) => {
