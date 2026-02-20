@@ -286,7 +286,7 @@ pub fn list_buses() -> impl MaybeFuture<Output = Result<impl Iterator<Item = Bus
 ///     when the `Connected` event is emitted. If you are immediately opening the device
 ///     and claiming an interface when receiving a `Connected` event,
 ///     you should retry after a short delay if opening or claiming fails.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", target_family = "wasm"))]
 pub fn watch_devices() -> Result<hotplug::HotplugWatch, Error> {
     Ok(hotplug::HotplugWatch(platform::HotplugWatch::new()?))
 }
