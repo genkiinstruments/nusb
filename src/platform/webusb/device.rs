@@ -10,7 +10,7 @@ pub use private::UniqueUsbDevice;
 use wasm_bindgen_futures::{js_sys::Array, spawn_local, wasm_bindgen::JsCast, JsFuture};
 use web_sys::{
     js_sys::{Object, Uint8Array},
-    UsbControlTransferParameters, UsbDevice, UsbInTransferResult, UsbOutTransferResult,
+    UsbControlTransferParameters, UsbDevice, UsbInTransferResult, UsbOutTransferResult, UsbTransferStatus,
 };
 
 use crate::{
@@ -260,17 +260,25 @@ pub async fn extract_string(device: &UsbDevice, id: u16) -> Result<String, Error
         .await
         .map_err(js_value_to_nusb_error)?;
     let res: UsbInTransferResult = JsCast::unchecked_from_js(res);
-    let mut data = Uint8Array::new(&res.data().expect("a data buffer").buffer()).to_vec();
+    let status = res.status();
+    let data = Uint8Array::new(&res.data().expect("a data buffer").buffer()).to_vec();
 
-    String::from_utf16(
-        &data
-            .drain(2..data[0] as usize)
-            .collect::<Vec<_>>()
-            .chunks(2)
-            .map(|c| ((c[1] as u16) << 8) | c[0] as u16)
-            .collect::<Vec<_>>(),
-    )
-    .map_err(|_| Error::new(ErrorKind::Other, "invalid utf16"))
+    match status {
+        UsbTransferStatus::Ok =>  match data.len() {
+            ..2 =>  Err(Error::new(ErrorKind::Other, "not enough data")),
+            _ => {
+                let len = data[0] as usize;
+                let utf16_data = data[2..len]
+                                .chunks(2)
+                                .map(|ch| u16::from_le_bytes([ch[0], ch[1]])).collect::<Vec<u16>>();
+
+                String::from_utf16(&utf16_data).map_err(|_| Error::new(ErrorKind::Other, "invalid utf16"))
+            }
+        }
+        e => Err(Error::new(ErrorKind::Other, "get descriptor error: {e:?}")),
+
+    }
+
 }
 
 #[derive(Clone)]
