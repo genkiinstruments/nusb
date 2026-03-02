@@ -275,7 +275,7 @@ pub async fn extract_string(device: &UsbDevice, id: u16) -> Result<String, Error
                 String::from_utf16(&utf16_data).map_err(|_| Error::new(ErrorKind::Other, "invalid utf16"))
             }
         }
-        e => Err(Error::new(ErrorKind::Other, "get descriptor error: {e:?}")),
+        _ => Err(Error::new(ErrorKind::Other, "get descriptor error")), // TODO: dynamic error can't be &'static str
 
     }
 
@@ -569,7 +569,7 @@ impl WebusbEndpoint {
         self.pending.push_back(transfer);
     }
 
-    pub(crate) fn submit_err(&mut self, buffer: Buffer, err: TransferError) {
+    pub(crate) fn submit_err(&mut self, _buffer: Buffer, err: TransferError) {
         assert_eq!(err, TransferError::InvalidArgument);
         todo!();
 
@@ -590,7 +590,7 @@ impl WebusbEndpoint {
         }
     }
 
-    pub(crate) fn wait_next_complete(&mut self, timeout: Duration) -> Option<Completion> {
+    pub(crate) fn wait_next_complete(&mut self, _timeout: Duration) -> Option<Completion> {
         todo!();
 
         // self.inner.notify.wait_timeout(timeout, || {

@@ -88,7 +88,7 @@ pub(crate) fn usb() -> Result<Usb, Error> {
 }
 
 pub fn js_value_to_nusb_error(value: JsValue) -> Error {
-    let value: js_sys::Error = value
+    let _value: js_sys::Error = value
         .dyn_into()
         .unwrap_or_else(|_| js_sys::Error::new("error could not be constructed"));
     Error::new(ErrorKind::Other,
