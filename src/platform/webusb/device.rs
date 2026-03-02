@@ -86,7 +86,7 @@ impl WebusbDevice {
             let devices = JsFuture::from(usb.get_devices())
                 .await
                 .map_err(js_value_to_nusb_error)?;
-            let devices: Array = JsCast::unchecked_from_js(devices);
+            let devices: Array = JsCast::unchecked_from_js(devices.into());
 
             for device in devices {
                 let device: UsbDevice = JsCast::unchecked_from_js(device);
@@ -244,7 +244,7 @@ pub async fn get_descriptor(
     let res = wasm_bindgen_futures::JsFuture::from(device.control_transfer_in(&setup, 255))
         .await
         .map_err(js_value_to_nusb_error)?;
-    let res: UsbInTransferResult = JsCast::unchecked_from_js(res);
+    let res: UsbInTransferResult = JsCast::unchecked_from_js(res.into());
     Ok(Uint8Array::new(&res.data().expect("a data buffer").buffer()).to_vec())
 }
 
@@ -259,7 +259,7 @@ pub async fn extract_string(device: &UsbDevice, id: u16) -> Result<String, Error
     let res = JsFuture::from(device.control_transfer_in(&setup, 255))
         .await
         .map_err(js_value_to_nusb_error)?;
-    let res: UsbInTransferResult = JsCast::unchecked_from_js(res);
+    let res: UsbInTransferResult = JsCast::unchecked_from_js(res.into());
     let status = res.status();
     let data = Uint8Array::new(&res.data().expect("a data buffer").buffer()).to_vec();
 
@@ -382,7 +382,7 @@ impl WebusbInterface {
             let res = JsFuture::from(self.device.device.control_transfer_in(&setup, 255))
                 .await
                 .map_err(js_value_to_transfer_error)?;
-            let res: UsbInTransferResult = JsCast::unchecked_from_js(res);
+            let res: UsbInTransferResult = JsCast::unchecked_from_js(res.into());
             let array = Uint8Array::new(&res.data().expect("a data buffer").buffer());
 
             Ok(array.to_vec())
@@ -413,7 +413,7 @@ impl WebusbInterface {
             )
             .await
             .map_err(js_value_to_transfer_error)?;
-            let res: UsbOutTransferResult = JsCast::unchecked_from_js(res);
+            let res: UsbOutTransferResult = JsCast::unchecked_from_js(res.into());
 
             webusb_status_to_nusb_transfer_error(res.status())
         })
@@ -516,7 +516,7 @@ impl WebusbEndpoint {
 
                     match fut.await {
                         Ok(result) => {
-                            let transfer_result: UsbOutTransferResult = JsCast::unchecked_from_js(result);
+                            let transfer_result: UsbOutTransferResult = JsCast::unchecked_from_js(result.into());
 
                             unsafe {
                                 (*ptr).actual_len = transfer_result.bytes_written();
@@ -537,7 +537,7 @@ impl WebusbEndpoint {
 
                     match result {
                         Ok(r) => {
-                            let transfer_result: UsbInTransferResult = JsCast::unchecked_from_js(r);
+                            let transfer_result: UsbInTransferResult = JsCast::unchecked_from_js(r.into());
                             let received_data = Uint8Array::new(
                                 &transfer_result
                                     .data()

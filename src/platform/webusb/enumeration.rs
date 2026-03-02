@@ -20,11 +20,11 @@ pub fn list_devices() -> impl MaybeFuture<Output = Result<impl Iterator<Item = D
             .await
             .map_err(|_| Error::new(ErrorKind::Other, "WebUSB devices could not be listed"))?;
 
-        let devices: Array = JsCast::unchecked_from_js(devices);
+        let devices: Array = JsCast::unchecked_from_js(devices.into());
 
         let mut result = vec![];
         for device in devices {
-            let device: UsbDevice = JsCast::unchecked_from_js(device);
+            let device: UsbDevice = JsCast::unchecked_from_js(device.into());
             JsFuture::from(device.open())
                 .await
                 .map_err(|_| Error::new(ErrorKind::Other, "WebUSB device could not be opened"))?;
