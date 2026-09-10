@@ -16,12 +16,10 @@ mod registry;
 pub(crate) use cfgmgr32::DevInst;
 use windows_sys::Win32::Foundation::WIN32_ERROR;
 pub(crate) use DevInst as DeviceId;
-#[cfg(not(target_vendor = "win7"))]
-#[path = "hotplug_win8.rs"]
+
+#[cfg_attr(target_vendor = "win7", path = "hotplug_win7.rs")]
 mod hotplug;
-#[cfg(target_vendor = "win7")]
-#[path = "hotplug_win7.rs"]
-mod hotplug;
+
 mod threadpool;
 mod util;
 pub(crate) use hotplug::WindowsHotplugWatch as HotplugWatch;
