@@ -24,7 +24,7 @@ use windows_sys::Win32::{
 
 use crate::{
     hotplug::HotplugEvent,
-    platform::windows_winusb::{cfgmgr32::get_device_interface_property, util::WCString},
+    platform::windows::{cfgmgr32::get_device_interface_property, util::WCString},
     DeviceId, Error,
 };
 

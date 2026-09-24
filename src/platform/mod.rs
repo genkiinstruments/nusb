@@ -5,10 +5,10 @@ mod linux_usbfs;
 pub use linux_usbfs::*;
 
 #[cfg(target_os = "windows")]
-mod windows_winusb;
+mod windows;
 
 #[cfg(target_os = "windows")]
-pub use windows_winusb::*;
+pub use windows::*;
 
 #[cfg(target_os = "macos")]
 mod macos_iokit;
