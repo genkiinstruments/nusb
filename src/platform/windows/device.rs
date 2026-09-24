@@ -687,7 +687,9 @@ impl WindowsInterface {
 
     fn post_submit(&self, r: i32, t: Pending<TransferData>) -> Pending<TransferData> {
         if r == TRUE {
-            error!("Transfer submit completed synchronously")
+            // The completion still reaches `io_callback`
+            debug!("Transfer submit completed synchronously");
+            return t;
         }
 
         let err = unsafe { GetLastError() };
