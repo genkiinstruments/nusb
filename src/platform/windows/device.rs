@@ -2,9 +2,9 @@ use std::{
     collections::{btree_map::Entry, BTreeMap, VecDeque},
     ffi::c_void,
     io,
-    mem::{self, size_of_val, transmute},
+    mem::{self, transmute},
     os::windows::io::{AsRawHandle, OwnedHandle, RawHandle},
-    ptr::{self, null_mut},
+    ptr::null_mut,
     sync::{Arc, Mutex},
     task::{Context, Poll},
     time::Duration,
@@ -12,16 +12,10 @@ use std::{
 
 use log::{debug, error, warn};
 use windows_sys::Win32::{
-    Devices::Usb::{
-        self, WinUsb_ControlTransfer, WinUsb_Free, WinUsb_GetAssociatedInterface,
-        WinUsb_Initialize, WinUsb_ReadPipe, WinUsb_ResetPipe, WinUsb_SetCurrentAlternateSetting,
-        WinUsb_SetPipePolicy, WinUsb_WritePipe, USB_DEVICE_DESCRIPTOR, WINUSB_INTERFACE_HANDLE,
-        WINUSB_SETUP_PACKET,
-    },
+    Devices::Usb::{USB_DEVICE_DESCRIPTOR, WINUSB_INTERFACE_HANDLE, WINUSB_SETUP_PACKET},
     Foundation::{
         GetLastError, ERROR_BAD_COMMAND, ERROR_DEVICE_NOT_CONNECTED, ERROR_FILE_NOT_FOUND,
-        ERROR_IO_PENDING, ERROR_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_NO_SUCH_DEVICE, FALSE,
-        HANDLE, TRUE,
+        ERROR_IO_PENDING, ERROR_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_NO_SUCH_DEVICE, HANDLE, TRUE,
     },
     System::{
         Threading::{
@@ -56,7 +50,7 @@ use super::{
     threadpool::Timer,
     transfer::TransferData,
     util::{create_file, raw_handle, WCStr},
-    DevInst,
+    winusb, DevInst,
 };
 
 pub(crate) struct WindowsDevice {
@@ -297,38 +291,12 @@ impl WinusbFileHandle {
             );
         }
 
-        let winusb_handle = unsafe {
-            let mut h = ptr::null_mut();
-            if WinUsb_Initialize(raw_handle(&handle), &mut h) == FALSE {
-                CloseThreadpoolIo(threadpool_io);
-                return Err(Error::new_os(
-                    ErrorKind::Other,
-                    "failed to initialize WinUSB",
-                    GetLastError(),
-                )
-                .log_debug());
-            }
-            h
-        };
+        let winusb_handle = winusb::initialize(raw_handle(&handle)).map_err(|e| {
+            unsafe { CloseThreadpoolIo(threadpool_io) };
+            Error::new_os(ErrorKind::Other, "failed to initialize WinUSB", e).log_debug()
+        })?;
 
         debug!("Opened WinUSB handle for {path} (interface {first_interface})");
-
-        unsafe {
-            // Disable WinUSB's default control transfer timeout so we can do our own
-            // per-request timeout handling by cancelling the transfer with a timer.
-            let timeout: u32 = 0;
-            let r = WinUsb_SetPipePolicy(
-                winusb_handle,
-                0x00,
-                Usb::PIPE_TRANSFER_TIMEOUT,
-                size_of_val(&timeout) as u32,
-                &timeout as *const _ as *const c_void,
-            );
-            if r != TRUE {
-                let err = GetLastError();
-                warn!("Failed to disable default timeout on control endpoint, error {err}");
-            }
-        }
 
         Ok(WinusbFileHandle {
             first_interface,
@@ -353,30 +321,24 @@ impl WinusbFileHandle {
         let winusb_handle = if self.first_interface == interface_number {
             self.winusb_handle
         } else {
-            unsafe {
-                let mut out_handle = ptr::null_mut();
-                let idx = interface_number - self.first_interface - 1;
-                if WinUsb_GetAssociatedInterface(self.winusb_handle, idx, &mut out_handle) == FALSE
-                {
-                    let err = GetLastError();
-                    debug!(
-                        "WinUsb_GetAssociatedInterface for interface {} using handle for {} failed: {:?}",
-                        interface_number, self.first_interface, err
-                    );
+            let idx = interface_number - self.first_interface - 1;
+            winusb::associated_interface(self.winusb_handle, idx).map_err(|err| {
+                debug!(
+                    "WinUsb_GetAssociatedInterface for interface {} using handle for {} failed: {:?}",
+                    interface_number, self.first_interface, err
+                );
 
-                    return Err(match err {
-                        ERROR_NO_MORE_ITEMS => {
-                            Error::new_os(ErrorKind::NotFound, "interface not found", err)
-                        }
-                        _ => Error::new_os(
-                            ErrorKind::Other,
-                            "failed to initialize WinUSB for associated interface",
-                            err,
-                        ),
-                    });
+                match err {
+                    ERROR_NO_MORE_ITEMS => {
+                        Error::new_os(ErrorKind::NotFound, "interface not found", err)
+                    }
+                    _ => Error::new_os(
+                        ErrorKind::Other,
+                        "failed to initialize WinUSB for associated interface",
+                        err,
+                    ),
                 }
-                out_handle
-            }
+            })?
         };
 
         log::debug!(
@@ -405,10 +367,8 @@ impl Drop for WinusbFileHandle {
             "Closing WinUSB handle for interface {}",
             self.first_interface
         );
-        unsafe {
-            CloseThreadpoolIo(self.threadpool_io);
-            WinUsb_Free(self.winusb_handle);
-        }
+        unsafe { CloseThreadpoolIo(self.threadpool_io) };
+        winusb::free(self.winusb_handle);
     }
 }
 
@@ -495,9 +455,7 @@ impl Drop for WindowsInterface {
                 "Closing WinUSB handle for associated interface {}",
                 self.interface_number
             );
-            unsafe {
-                WinUsb_Free(self.winusb_handle);
-            }
+            winusb::free(self.winusb_handle);
         }
 
         let mut handles = self.device.handles.lock().unwrap();
@@ -575,7 +533,7 @@ impl WindowsInterface {
         self: Arc<Self>,
         alt_setting: u8,
     ) -> impl MaybeFuture<Output = Result<(), Error>> {
-        Blocking::new(move || unsafe {
+        Blocking::new(move || {
             let mut state = self.state.lock().unwrap();
             if !state.endpoints.is_empty() {
                 return Err(Error::new(
@@ -583,16 +541,16 @@ impl WindowsInterface {
                     "can't change alternate setting while endpoints are in use",
                 ));
             }
-            let r = WinUsb_SetCurrentAlternateSetting(self.winusb_handle, alt_setting);
-            if r == TRUE {
-                debug!(
-                    "Set interface {} alt setting to {alt_setting}",
-                    self.interface_number
-                );
-                state.alt_setting = alt_setting;
-                Ok(())
-            } else {
-                Err(match GetLastError() {
+            match winusb::set_alt_setting(self.winusb_handle, alt_setting) {
+                Ok(()) => {
+                    debug!(
+                        "Set interface {} alt setting to {alt_setting}",
+                        self.interface_number
+                    );
+                    state.alt_setting = alt_setting;
+                    Ok(())
+                }
+                Err(e) => Err(match e {
                     e @ ERROR_NOT_FOUND => {
                         Error::new_os(ErrorKind::NotFound, "alternate setting not found", e)
                     }
@@ -600,7 +558,7 @@ impl WindowsInterface {
                         Error::new_os(ErrorKind::Disconnected, "device disconnected", e)
                     }
                     e => Error::new_os(ErrorKind::Other, "failed to set alternate setting", e),
-                })
+                }),
             }
         })
     }
@@ -624,20 +582,7 @@ impl WindowsInterface {
         state.endpoints.set(address);
 
         if Direction::from_address(address) == Direction::In {
-            unsafe {
-                let enable: u8 = 1;
-                let r = WinUsb_SetPipePolicy(
-                    self.winusb_handle,
-                    address,
-                    Usb::RAW_IO,
-                    size_of_val(&enable) as u32,
-                    &enable as *const _ as *const c_void,
-                );
-                if r != TRUE {
-                    let err = GetLastError();
-                    warn!("Failed to enable RAW_IO on endpoint {address:02X}: error {err:x}",);
-                }
-            }
+            winusb::enable_raw_io(self.winusb_handle, address);
         }
 
         Ok(WindowsEndpoint {
@@ -670,24 +615,13 @@ impl WindowsInterface {
         }
 
         let r = unsafe {
-            match dir {
-                Direction::Out => WinUsb_WritePipe(
-                    self.winusb_handle,
-                    endpoint,
-                    buf,
-                    len,
-                    null_mut(),
-                    ptr as *mut OVERLAPPED,
-                ),
-                Direction::In => WinUsb_ReadPipe(
-                    self.winusb_handle,
-                    endpoint,
-                    buf,
-                    len,
-                    null_mut(),
-                    ptr as *mut OVERLAPPED,
-                ),
-            }
+            winusb::submit(
+                self.winusb_handle,
+                endpoint,
+                buf,
+                len,
+                ptr as *mut OVERLAPPED,
+            )
         };
 
         self.post_submit(r, t)
@@ -743,14 +677,7 @@ impl WindowsInterface {
         }
 
         let r = unsafe {
-            WinUsb_ControlTransfer(
-                self.winusb_handle,
-                pkt,
-                buf,
-                len,
-                null_mut(),
-                ptr as *mut OVERLAPPED,
-            )
+            winusb::submit_control(self.winusb_handle, pkt, buf, len, ptr as *mut OVERLAPPED)
         };
 
         drop(lock);
@@ -904,15 +831,8 @@ impl WindowsEndpoint {
         Blocking::new(move || {
             let endpoint = inner.address;
             debug!("Clear halt, endpoint {endpoint:02x}");
-            unsafe {
-                if WinUsb_ResetPipe(inner.interface.winusb_handle, endpoint) == TRUE {
-                    Ok(())
-                } else {
-                    Err(match GetLastError() {
-                        e => Error::new_os(ErrorKind::Other, "failed to clear halt", e),
-                    })
-                }
-            }
+            winusb::reset_pipe(inner.interface.winusb_handle, endpoint)
+                .map_err(|e| Error::new_os(ErrorKind::Other, "failed to clear halt", e))
         })
     }
 }

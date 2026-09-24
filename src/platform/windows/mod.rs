@@ -9,6 +9,7 @@ pub(crate) use device::WindowsEndpoint as Endpoint;
 pub(crate) use device::WindowsInterface as Interface;
 
 mod transfer;
+mod winusb;
 
 mod cfgmgr32;
 mod hub;
