@@ -1,3 +1,4 @@
+mod driver;
 mod enumeration;
 use std::num::NonZeroU32;
 
@@ -8,6 +9,7 @@ pub(crate) use device::WindowsDevice as Device;
 pub(crate) use device::WindowsEndpoint as Endpoint;
 pub(crate) use device::WindowsInterface as Interface;
 
+mod libusb0;
 mod transfer;
 mod winusb;
 

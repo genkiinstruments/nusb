@@ -131,7 +131,8 @@
 //!
 //! ### Windows
 //!
-//! `nusb` uses [WinUSB] on Windows.
+//! `nusb` uses [WinUSB] on Windows, and also supports devices bound to
+//! libusb-win32's [libusb0] driver.
 //!
 //! On Windows, devices are associated with a particular driver, which persists
 //! across connections and reboots. Composite devices appear as multiple devices
@@ -139,15 +140,16 @@
 //! separate driver.
 //!
 //! To use `nusb`, your device or interface must be associated with the `WinUSB`
-//! driver. If you control the device firmware, the recommended way is to use a
-//! [WCID] descriptor to tell Windows to install the WinUSB driver automatically
-//! when the device is first connected. Alternatively [Zadig] (GUI) or [libwdi]
-//! (CLI / C library) can be used to manually install the WinUSB driver for a
-//! device.
+//! or `libusb0` driver. If you control the device firmware, the recommended way
+//! is to use a [WCID] descriptor to tell Windows to install the WinUSB driver
+//! automatically when the device is first connected. Alternatively [Zadig]
+//! (GUI) or [libwdi] (CLI / C library) can be used to manually install either
+//! driver for a device.
 //!
 //! [SetupAPI]:
 //!     https://learn.microsoft.com/en-us/windows-hardware/drivers/install/setupapi
 //! [WinUSB]: https://learn.microsoft.com/en-us/windows/win32/api/winusb/
+//! [libusb0]: https://github.com/mcuee/libusb-win32
 //! [WCID]: https://github.com/pbatard/libwdi/wiki/WCID-Devices
 //! [Zadig]:https://zadig.akeo.ie/
 //! [libwdi]: https://github.com/pbatard/libwdi

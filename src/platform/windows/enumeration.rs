@@ -1,13 +1,16 @@
 use std::ffi::{OsStr, OsString};
 
 use log::debug;
-use windows_sys::Win32::Devices::{
-    Properties::{
-        DEVPKEY_Device_Address, DEVPKEY_Device_BusReportedDeviceDesc, DEVPKEY_Device_DeviceDesc,
-        DEVPKEY_Device_HardwareIds, DEVPKEY_Device_InstanceId, DEVPKEY_Device_LocationPaths,
-        DEVPKEY_Device_Parent, DEVPKEY_Device_Service,
+use windows_sys::{
+    core::GUID,
+    Win32::Devices::{
+        Properties::{
+            DEVPKEY_Device_Address, DEVPKEY_Device_BusReportedDeviceDesc,
+            DEVPKEY_Device_DeviceDesc, DEVPKEY_Device_HardwareIds, DEVPKEY_Device_InstanceId,
+            DEVPKEY_Device_LocationPaths, DEVPKEY_Device_Parent, DEVPKEY_Device_Service,
+        },
+        Usb::{GUID_DEVINTERFACE_USB_DEVICE, GUID_DEVINTERFACE_USB_HUB},
     },
-    Usb::{GUID_DEVINTERFACE_USB_DEVICE, GUID_DEVINTERFACE_USB_HUB},
 };
 
 use crate::{
@@ -21,6 +24,7 @@ use crate::{
 
 use super::{
     cfgmgr32::{self, get_device_interface_property, DevInst},
+    driver::Driver,
     hub::HubPort,
     util::WCString,
 };
@@ -227,14 +231,14 @@ pub(crate) fn get_driver_name(dev: DevInst) -> String {
         .unwrap_or_default()
 }
 
-/// Get the device path to open for a whole device bound to WinUSB.
-pub(crate) fn get_winusb_device_path(dev: DevInst) -> Result<WCString, Error> {
+/// Get the device path to open for a whole device bound to WinUSB or libusb0.
+pub(crate) fn get_device_path(dev: DevInst) -> Result<WCString, Error> {
     let paths = dev.interfaces(GUID_DEVINTERFACE_USB_DEVICE);
 
     let Some(path) = paths.iter().next() else {
         return Err(Error::new(
             ErrorKind::Other,
-            "failed to find device path for WinUSB device",
+            "failed to find device path for device",
         ));
     };
 
@@ -255,8 +259,10 @@ pub(crate) fn find_usbccgp_child(dev: DevInst, interface: u8) -> Option<(u8, Dev
         .max_by_key(|(interface_number, _)| *interface_number)
 }
 
+const LIBUSB0_DEVICE_INTERFACE: GUID = GUID::from_u128(0x20343a29_6da1_4db8_8a3c_16e774057bf5);
+
 /// Get the device path to open for a child PDO of a USBCCGP device.
-pub(crate) fn get_usbccgp_winusb_device_path(child: DevInst) -> Result<WCString, Error> {
+pub(crate) fn get_usbccgp_device_path(child: DevInst) -> Result<(WCString, Driver), Error> {
     let Some(driver) = child.get_property::<OsString>(DEVPKEY_Device_Service) else {
         return Err(Error::new(
             ErrorKind::Unsupported,
@@ -264,14 +270,38 @@ pub(crate) fn get_usbccgp_winusb_device_path(child: DevInst) -> Result<WCString,
         ));
     };
 
-    if !driver.eq_ignore_ascii_case("winusb") {
-        debug!("Incompatible driver {driver:?} for interface, not WinUSB");
-        return Err(Error::new(
-            ErrorKind::Unsupported,
-            "incompatible driver is installed for this interface",
-        ));
+    match driver.to_str().and_then(Driver::from_name) {
+        Some(Driver::WinUsb) => Ok((get_winusb_interface_path(child)?, Driver::WinUsb)),
+        Some(Driver::Libusb0) => Ok((get_libusb0_interface_path(child)?, Driver::Libusb0)),
+        None => {
+            debug!("Incompatible driver {driver:?} for interface, not WinUSB or libusb0");
+            Err(Error::new(
+                ErrorKind::Unsupported,
+                "incompatible driver is installed for this interface",
+            ))
+        }
     }
+}
 
+fn get_libusb0_interface_path(child: DevInst) -> Result<WCString, Error> {
+    let custom = child
+        .registry_key()
+        .and_then(|k| k.query_value_guid("DeviceInterfaceGUIDs").ok());
+
+    custom
+        .into_iter()
+        .chain([LIBUSB0_DEVICE_INTERFACE])
+        .find_map(|guid| child.interfaces(guid).iter().next().map(|p| p.to_owned()))
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unsupported,
+                "failed to find device path for libusb0 interface",
+            )
+            .log_debug()
+        })
+}
+
+fn get_winusb_interface_path(child: DevInst) -> Result<WCString, Error> {
     let reg_key = child.registry_key().unwrap();
     let guid = match reg_key.query_value_guid("DeviceInterfaceGUIDs") {
         Ok(s) => s,

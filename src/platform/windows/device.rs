@@ -14,8 +14,10 @@ use log::{debug, error, warn};
 use windows_sys::Win32::{
     Devices::Usb::{USB_DEVICE_DESCRIPTOR, WINUSB_INTERFACE_HANDLE, WINUSB_SETUP_PACKET},
     Foundation::{
-        GetLastError, ERROR_BAD_COMMAND, ERROR_DEVICE_NOT_CONNECTED, ERROR_FILE_NOT_FOUND,
-        ERROR_IO_PENDING, ERROR_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_NO_SUCH_DEVICE, HANDLE, TRUE,
+        GetLastError, ERROR_BAD_COMMAND, ERROR_BUSY, ERROR_DEVICE_NOT_CONNECTED,
+        ERROR_FILE_NOT_FOUND, ERROR_GEN_FAILURE, ERROR_INVALID_PARAMETER, ERROR_IO_PENDING,
+        ERROR_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_NO_SUCH_DEVICE, ERROR_SEM_TIMEOUT, HANDLE,
+        TRUE, WIN32_ERROR,
     },
     System::{
         Threading::{
@@ -43,10 +45,10 @@ use crate::{
 };
 
 use super::{
-    enumeration::{
-        find_usbccgp_child, get_driver_name, get_usbccgp_winusb_device_path, get_winusb_device_path,
-    },
+    driver::{ControlTransfer, Driver, DriverHandle},
+    enumeration::{find_usbccgp_child, get_device_path, get_driver_name, get_usbccgp_device_path},
     hub::HubPort,
+    libusb0,
     threadpool::Timer,
     transfer::TransferData,
     util::{create_file, raw_handle, WCStr},
@@ -59,7 +61,7 @@ pub(crate) struct WindowsDevice {
     active_config: u8,
     speed: Option<Speed>,
     devinst: DevInst,
-    handles: Mutex<BTreeMap<u8, WinusbFileHandle>>,
+    handles: Mutex<BTreeMap<u8, FileHandle>>,
 }
 
 impl WindowsDevice {
@@ -177,12 +179,12 @@ impl WindowsDevice {
 
             let mut handles = self.handles.lock().unwrap();
 
-            if driver.eq_ignore_ascii_case("winusb") {
+            if let Some(driver) = Driver::from_name(&driver) {
                 match handles.entry(0) {
                     Entry::Occupied(mut e) => e.get_mut().claim_interface(&self, interface_number),
                     Entry::Vacant(e) => {
-                        let path = get_winusb_device_path(self.devinst)?;
-                        let mut handle = WinusbFileHandle::new(&path, 0)?;
+                        let path = get_device_path(self.devinst)?;
+                        let mut handle = FileHandle::new(&path, 0, driver)?;
                         let intf = handle.claim_interface(&self, interface_number)?;
                         e.insert(handle);
                         Ok(intf)
@@ -200,15 +202,15 @@ impl WindowsDevice {
                 match handles.entry(first_interface) {
                     Entry::Occupied(mut e) => e.get_mut().claim_interface(&self, interface_number),
                     Entry::Vacant(e) => {
-                        let path = get_usbccgp_winusb_device_path(child_dev)?;
-                        let mut handle = WinusbFileHandle::new(&path, first_interface)?;
+                        let (path, driver) = get_usbccgp_device_path(child_dev)?;
+                        let mut handle = FileHandle::new(&path, first_interface, driver)?;
                         let intf = handle.claim_interface(&self, interface_number)?;
                         e.insert(handle);
                         Ok(intf)
                     }
                 }
             } else {
-                debug!("Device driver is {driver:?}, not WinUSB or USBCCGP");
+                debug!("Device driver is {driver:?}, not WinUSB, libusb0 or USBCCGP");
                 Err(Error::new(
                     ErrorKind::Unsupported,
                     "incompatible driver is installed for this device",
@@ -257,21 +259,21 @@ impl BitSet256 {
     }
 }
 
-/// A file handle and the WinUSB handle for the first interface.
-pub(crate) struct WinusbFileHandle {
+/// A file handle and the driver handle for the first interface.
+pub(crate) struct FileHandle {
     first_interface: u8,
     handle: OwnedHandle,
     threadpool_io: PTP_IO,
-    winusb_handle: WINUSB_INTERFACE_HANDLE,
+    driver_handle: DriverHandle,
     claimed_interfaces: BitSet256,
 }
 
-// SAFETY: WinUSB methods on the interface handle are thread-safe
-unsafe impl Send for WinusbFileHandle {}
-unsafe impl Sync for WinusbFileHandle {}
+// SAFETY: WinUSB methods on the interface handle and libusb0 IOCTLs on the file handle are thread-safe
+unsafe impl Send for FileHandle {}
+unsafe impl Sync for FileHandle {}
 
-impl WinusbFileHandle {
-    fn new(path: &WCStr, first_interface: u8) -> Result<Self, Error> {
+impl FileHandle {
+    fn new(path: &WCStr, first_interface: u8, driver: Driver) -> Result<Self, Error> {
         let handle = create_file(path)
             .map_err(|e| Error::new_os(ErrorKind::Other, "failed to open device", e).log_debug())?;
 
@@ -291,18 +293,18 @@ impl WinusbFileHandle {
             );
         }
 
-        let winusb_handle = winusb::initialize(raw_handle(&handle)).map_err(|e| {
+        let driver_handle = driver.open(raw_handle(&handle)).map_err(|e| {
             unsafe { CloseThreadpoolIo(threadpool_io) };
-            Error::new_os(ErrorKind::Other, "failed to initialize WinUSB", e).log_debug()
+            Error::new_os(ErrorKind::Other, "failed to initialize driver", e).log_debug()
         })?;
 
-        debug!("Opened WinUSB handle for {path} (interface {first_interface})");
+        debug!("Opened {driver:?} handle for {path} (interface {first_interface})");
 
-        Ok(WinusbFileHandle {
+        Ok(FileHandle {
             first_interface,
             handle,
             threadpool_io,
-            winusb_handle,
+            driver_handle,
             claimed_interfaces: BitSet256::new(),
         })
     }
@@ -318,27 +320,48 @@ impl WinusbFileHandle {
             return Err(Error::new(ErrorKind::Busy, "interface is already claimed"));
         }
 
-        let winusb_handle = if self.first_interface == interface_number {
-            self.winusb_handle
-        } else {
-            let idx = interface_number - self.first_interface - 1;
-            winusb::associated_interface(self.winusb_handle, idx).map_err(|err| {
-                debug!(
-                    "WinUsb_GetAssociatedInterface for interface {} using handle for {} failed: {:?}",
-                    interface_number, self.first_interface, err
-                );
+        let driver_handle = match &self.driver_handle {
+            DriverHandle::Libusb0(control) => {
+                libusb0::claim_interface(raw_handle(&self.handle), interface_number).map_err(
+                    |err| {
+                        debug!("libusb0 claim of interface {interface_number} failed: {err}");
+                        match err {
+                            ERROR_INVALID_PARAMETER => {
+                                Error::new_os(ErrorKind::NotFound, "interface not found", err)
+                            }
+                            ERROR_BUSY => {
+                                Error::new_os(ErrorKind::Busy, "interface is already claimed", err)
+                            }
+                            _ => Error::new_os(ErrorKind::Other, "failed to claim interface", err),
+                        }
+                    },
+                )?;
+                DriverHandle::Libusb0(control.clone())
+            }
+            DriverHandle::WinUsb(winusb_handle) if self.first_interface == interface_number => {
+                DriverHandle::WinUsb(*winusb_handle)
+            }
+            DriverHandle::WinUsb(winusb_handle) => {
+                let idx = interface_number - self.first_interface - 1;
+                let h = winusb::associated_interface(*winusb_handle, idx).map_err(|err| {
+                    debug!(
+                        "WinUsb_GetAssociatedInterface for interface {} using handle for {} failed: {:?}",
+                        interface_number, self.first_interface, err
+                    );
 
-                match err {
-                    ERROR_NO_MORE_ITEMS => {
-                        Error::new_os(ErrorKind::NotFound, "interface not found", err)
+                    match err {
+                        ERROR_NO_MORE_ITEMS => {
+                            Error::new_os(ErrorKind::NotFound, "interface not found", err)
+                        }
+                        _ => Error::new_os(
+                            ErrorKind::Other,
+                            "failed to initialize WinUSB for associated interface",
+                            err,
+                        ),
                     }
-                    _ => Error::new_os(
-                        ErrorKind::Other,
-                        "failed to initialize WinUSB for associated interface",
-                        err,
-                    ),
-                }
-            })?
+                })?;
+                DriverHandle::WinUsb(h)
+            }
         };
 
         log::debug!(
@@ -354,21 +377,20 @@ impl WinusbFileHandle {
             device: device.clone(),
             interface_number,
             first_interface_number: self.first_interface,
-            winusb_handle,
+            driver_handle,
             state: Mutex::new(InterfaceState::default()),
             timeout_mutex: Mutex::new(()),
         }))
     }
 }
 
-impl Drop for WinusbFileHandle {
+impl Drop for FileHandle {
     fn drop(&mut self) {
-        log::debug!(
-            "Closing WinUSB handle for interface {}",
-            self.first_interface
-        );
+        log::debug!("Closing handle for interface {}", self.first_interface);
         unsafe { CloseThreadpoolIo(self.threadpool_io) };
-        winusb::free(self.winusb_handle);
+        if let DriverHandle::WinUsb(winusb_handle) = self.driver_handle {
+            winusb::free(winusb_handle);
+        }
     }
 }
 
@@ -418,18 +440,18 @@ unsafe extern "system" fn timer_callback(
 }
 
 pub(crate) struct WindowsInterface {
-    /// Owned by the `WinUSBFileHandle`
+    /// Owned by the `FileHandle`
     pub(crate) handle: RawHandle,
 
-    /// Owned by the `WinUSBFileHandle`
+    /// Owned by the `FileHandle`
     pub(crate) threadpool_io: PTP_IO,
 
     pub(crate) device: Arc<WindowsDevice>,
     pub(crate) first_interface_number: u8,
     pub(crate) interface_number: u8,
 
-    /// Owned by this object if `first_interface_number != interface_number`, otherwise owned by the `WinUSBFileHandle`
-    pub(crate) winusb_handle: WINUSB_INTERFACE_HANDLE,
+    /// WinUSB handle owned by this object if `first_interface_number != interface_number`, otherwise owned by the `FileHandle`
+    pub(crate) driver_handle: DriverHandle,
     state: Mutex<InterfaceState>,
 
     /// Used to synchronize control transfer timeouts with transfer submission.
@@ -447,15 +469,28 @@ unsafe impl Sync for WindowsInterface {}
 
 impl Drop for WindowsInterface {
     fn drop(&mut self) {
-        // The WinUSB handle for the first interface is owned by WinusbFileHandle
+        // The WinUSB handle for the first interface is owned by FileHandle
         // because it is used to open subsequent interfaces.
         let is_first_interface = self.interface_number == self.first_interface_number;
-        if !is_first_interface {
-            log::debug!(
-                "Closing WinUSB handle for associated interface {}",
-                self.interface_number
-            );
-            winusb::free(self.winusb_handle);
+        match self.driver_handle {
+            DriverHandle::WinUsb(winusb_handle) if !is_first_interface => {
+                log::debug!(
+                    "Closing WinUSB handle for associated interface {}",
+                    self.interface_number
+                );
+                winusb::free(winusb_handle);
+            }
+            DriverHandle::WinUsb(_) => {}
+            DriverHandle::Libusb0(_) => {
+                if let Err(err) =
+                    libusb0::release_interface(self.handle as HANDLE, self.interface_number)
+                {
+                    warn!(
+                        "Failed to release libusb0 interface {}: error {err}",
+                        self.interface_number
+                    );
+                }
+            }
         }
 
         let mut handles = self.device.handles.lock().unwrap();
@@ -485,9 +520,6 @@ impl WindowsInterface {
         data: ControlIn,
         timeout: Duration,
     ) -> impl MaybeFuture<Output = Result<Vec<u8>, TransferError>> {
-        let mut t = TransferData::new(self.clone(), 0x80);
-        t.set_buffer(Buffer::new(data.length as usize));
-
         let pkt = WINUSB_SETUP_PACKET {
             RequestType: data.request_type(),
             Request: data.request,
@@ -498,11 +530,32 @@ impl WindowsInterface {
 
         let intf = self.clone();
 
-        TransferFuture::new(t, |t| self.submit_control(t, pkt, timeout)).map(move |mut t| {
-            let c = t.take_completion(&intf);
-            c.status?;
-            Ok(c.buffer.into_vec())
-        })
+        match &self.driver_handle {
+            DriverHandle::WinUsb(h) => {
+                let mut t = TransferData::new(self.clone(), 0x80);
+                t.set_buffer(Buffer::new(data.length as usize));
+
+                ControlTransfer::WinUsb(
+                    TransferFuture::new(t, |t| self.submit_winusb_control(t, *h, pkt, timeout))
+                        .map(move |mut t| {
+                            let c = t.take_completion(&intf);
+                            c.status?;
+                            Ok(c.buffer.into_vec())
+                        }),
+                )
+            }
+            DriverHandle::Libusb0(control) => {
+                let control = control.clone();
+                ControlTransfer::Libusb0(Blocking::new(move || {
+                    let mut buf = vec![0; pkt.Length as usize];
+                    let len = control
+                        .transfer(intf.handle as HANDLE, pkt, &mut buf, timeout)
+                        .map_err(transfer_error)?;
+                    buf.truncate(len as usize);
+                    Ok(buf)
+                }))
+            }
+        }
     }
 
     pub fn control_out(
@@ -510,9 +563,6 @@ impl WindowsInterface {
         data: ControlOut,
         timeout: Duration,
     ) -> impl MaybeFuture<Output = Result<(), TransferError>> {
-        let mut t = TransferData::new(self.clone(), 0x00);
-        t.set_buffer(Buffer::from(data.data.to_vec()));
-
         let pkt = WINUSB_SETUP_PACKET {
             RequestType: data.request_type(),
             Request: data.request,
@@ -523,10 +573,30 @@ impl WindowsInterface {
 
         let intf = self.clone();
 
-        TransferFuture::new(t, |t| self.submit_control(t, pkt, timeout)).map(move |mut t| {
-            let c = t.take_completion(&intf);
-            c.status
-        })
+        match &self.driver_handle {
+            DriverHandle::WinUsb(h) => {
+                let mut t = TransferData::new(self.clone(), 0x00);
+                t.set_buffer(Buffer::from(data.data.to_vec()));
+
+                ControlTransfer::WinUsb(
+                    TransferFuture::new(t, |t| self.submit_winusb_control(t, *h, pkt, timeout))
+                        .map(move |mut t| {
+                            let c = t.take_completion(&intf);
+                            c.status
+                        }),
+                )
+            }
+            DriverHandle::Libusb0(control) => {
+                let control = control.clone();
+                let mut buf = data.data.to_vec();
+                ControlTransfer::Libusb0(Blocking::new(move || {
+                    control
+                        .transfer(intf.handle as HANDLE, pkt, &mut buf, timeout)
+                        .map(drop)
+                        .map_err(transfer_error)
+                }))
+            }
+        }
     }
 
     pub fn set_alt_setting(
@@ -541,7 +611,11 @@ impl WindowsInterface {
                     "can't change alternate setting while endpoints are in use",
                 ));
             }
-            match winusb::set_alt_setting(self.winusb_handle, alt_setting) {
+            match self.driver_handle.set_alt_setting(
+                self.handle as HANDLE,
+                self.interface_number,
+                alt_setting,
+            ) {
                 Ok(()) => {
                     debug!(
                         "Set interface {} alt setting to {alt_setting}",
@@ -551,7 +625,7 @@ impl WindowsInterface {
                     Ok(())
                 }
                 Err(e) => Err(match e {
-                    e @ ERROR_NOT_FOUND => {
+                    e @ (ERROR_NOT_FOUND | ERROR_NO_MORE_ITEMS) => {
                         Error::new_os(ErrorKind::NotFound, "alternate setting not found", e)
                     }
                     e @ ERROR_BAD_COMMAND => {
@@ -581,8 +655,10 @@ impl WindowsInterface {
         }
         state.endpoints.set(address);
 
-        if Direction::from_address(address) == Direction::In {
-            winusb::enable_raw_io(self.winusb_handle, address);
+        if let (DriverHandle::WinUsb(winusb_handle), Direction::In) =
+            (&self.driver_handle, Direction::from_address(address))
+        {
+            winusb::enable_raw_io(*winusb_handle, address);
         }
 
         Ok(WindowsEndpoint {
@@ -615,8 +691,8 @@ impl WindowsInterface {
         }
 
         let r = unsafe {
-            winusb::submit(
-                self.winusb_handle,
+            self.driver_handle.submit(
+                self.handle as HANDLE,
                 endpoint,
                 buf,
                 len,
@@ -627,9 +703,10 @@ impl WindowsInterface {
         self.post_submit(r, t)
     }
 
-    fn submit_control(
+    fn submit_winusb_control(
         &self,
         mut t: Idle<TransferData>,
+        winusb_handle: WINUSB_INTERFACE_HANDLE,
         pkt: WINUSB_SETUP_PACKET,
         timeout: Duration,
     ) -> Pending<TransferData> {
@@ -676,9 +753,8 @@ impl WindowsInterface {
             StartThreadpoolIo(self.threadpool_io);
         }
 
-        let r = unsafe {
-            winusb::submit_control(self.winusb_handle, pkt, buf, len, ptr as *mut OVERLAPPED)
-        };
+        let r =
+            unsafe { winusb::submit_control(winusb_handle, pkt, buf, len, ptr as *mut OVERLAPPED) };
 
         drop(lock);
 
@@ -833,7 +909,9 @@ impl WindowsEndpoint {
         Blocking::new(move || {
             let endpoint = inner.address;
             debug!("Clear halt, endpoint {endpoint:02x}");
-            winusb::reset_pipe(inner.interface.winusb_handle, endpoint)
+            let intf = &inner.interface;
+            intf.driver_handle
+                .clear_halt(intf.handle as HANDLE, endpoint)
                 .map_err(|e| Error::new_os(ErrorKind::Other, "failed to clear halt", e))
         })
     }
@@ -862,5 +940,17 @@ impl Drop for EndpointInner {
     fn drop(&mut self) {
         let mut state = self.interface.state.lock().unwrap();
         state.endpoints.clear(self.address);
+    }
+}
+
+fn transfer_error(err: WIN32_ERROR) -> TransferError {
+    match err {
+        ERROR_GEN_FAILURE => TransferError::Stall,
+        ERROR_SEM_TIMEOUT => TransferError::Cancelled,
+        ERROR_BAD_COMMAND
+        | ERROR_FILE_NOT_FOUND
+        | ERROR_DEVICE_NOT_CONNECTED
+        | ERROR_NO_SUCH_DEVICE => TransferError::Disconnected,
+        other => TransferError::Unknown(other),
     }
 }
